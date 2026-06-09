@@ -14,7 +14,7 @@ Jetpack Compose 기반의 MVVM 아키텍처로 구현했으며, 초기 구현의
 | Language | Kotlin |
 | UI | Jetpack Compose |
 | Architecture | MVVM |
-| Concurrency | Kotlin Coroutines (`viewModelScope`, `Dispatchers.Main`) |
+| Concurrency | Kotlin Coroutines (`LaunchedEffect`, `withFrameNanos`) |
 | Sensor | Android SensorManager (TYPE_ACCELEROMETER, SENSOR_DELAY_GAME) |
 | Performance | `adb shell dumpsys gfxinfo` |
 
@@ -67,14 +67,14 @@ fun TiltBallContent(tiltX: Float, tiltY: Float, ...) {
 ### 개선된 구조
 
 ```
-[물리 게임 루프] Dispatchers.Main 코루틴 (고정 16ms 주기)
+[물리 게임 루프] LaunchedEffect + withFrameNanos (vsync 동기화)
     → 물리 계산 실행
         → Ball 위치 상태 업데이트 (SnapshotStateList)
 
 [센서 이벤트] 센서 스레드
     → tiltX / tiltY 값만 업데이트 (@Volatile)
 
-[Compose] 프레임마다
+[Compose] vsync마다
     → Ball 위치 읽기
         → Canvas 렌더링만 담당
 ```
@@ -84,7 +84,7 @@ fun TiltBallContent(tiltX: Float, tiltY: Float, ...) {
 ```
 Before                          After
 ──────────────────────────────  ──────────────────────────────
-MainActivity.kt                 MainActivity.kt        (렌더링 전용)
+MainActivity.kt                 MainActivity.kt        (렌더링 + 게임 루프 트리거)
   ├── Ball (inner class)   →    Ball.kt                (모델 분리)
   ├── TiltBallScreen           PhysicsViewModel.kt    (물리 + 센서)
   ├── TiltBallContent
@@ -96,17 +96,25 @@ SensorViewModel.kt         →   (PhysicsViewModel에 통합)
 
 ## 주요 개선 포인트
 
-### 1. 고정 주기 게임 루프 (`PhysicsViewModel.kt`)
+### 1. vsync 동기화 게임 루프 (`MainActivity.kt`)
 
-센서 이벤트에 의존하던 불규칙한 업데이트를 `Dispatchers.Main` 코루틴 기반의 고정 16ms 게임 루프로 교체했습니다.
+`delay(16L)` 기반 고정 주기 루프는 OS 타이머 기준으로 실행되어 실제 화면 갱신(vsync)과 위상 차이가 생깁니다.  
+`withFrameNanos`를 `LaunchedEffect` 안에서 사용하면 Compose의 `MonotonicFrameClock`에 동기화되어 렌더링 직전에 정확히 물리가 갱신됩니다.
 
 ```kotlin
-// ✅ ViewModel에서 독립적인 게임 루프 실행
-private fun startGameLoop() {
-    viewModelScope.launch(Dispatchers.Main) {
-        while (isActive) {
-            if (containerWidth > 0f) updatePhysics()
-            delay(16L)  // ~60fps 고정 주기
+// ❌ 이전 — OS 타이머 기준, vsync와 위상 차이 발생
+viewModelScope.launch(Dispatchers.Main) {
+    while (isActive) {
+        updatePhysics()
+        delay(16L)
+    }
+}
+
+// ✅ 개선 — Compose 프레임 클럭에 동기화, 렌더링 직전에 정확히 1회 실행
+LaunchedEffect(Unit) {
+    while (true) {
+        withFrameNanos {
+            if (viewModel.containerWidth > 0f) viewModel.updatePhysics()
         }
     }
 }
@@ -132,7 +140,7 @@ override fun onSensorChanged(event: SensorEvent) {
 하나의 함수에 섞여 있던 물리 로직을 역할별로 분리했습니다.
 
 ```kotlin
-private fun updatePhysics() {
+fun updatePhysics() {
     repeat(SUB_STEPS) {
         applyForces()
         repeat(COLLISION_ITERATIONS) {
@@ -147,24 +155,35 @@ private fun resolveBallCollisions() { /* 공 간 충돌 감지 및 반발 */ }
 private fun resolveWallCollisions() { /* 벽 충돌 및 반사 */ }
 ```
 
-### 4. 상수 집중 관리 (`companion object`)
+### 4. 물리 상수 튜닝 및 `companion object` 집중 관리
 
-매직 넘버를 모두 `companion object`로 이름을 붙여 정의했습니다.
+매직 넘버를 모두 `companion object`로 이름을 붙여 정의하고, 자연스러운 물리감을 위해 값을 조정했습니다.
+
+| 상수 | 초기값 | 최종값 | 변경 이유 |
+|---|---|---|---|
+| `SENSITIVITY` | 45f | **60f** | 기울기가 속도에 더 빠르게 반영 |
+| `MAX_SPEED` | 15f | **15f** | 유지 (과도한 속도 방지) |
+| `DAMPING` | 0.995f | **0.992f** | 감쇠를 약간 높여 제어감 개선 |
+| `SUB_STEPS` | 6 | **8** | 시뮬레이션 정밀도 향상 |
+| `COLLISION_ITERATIONS` | 5 | **6** | 충돌 해소 정확도 향상 |
+| `SEPARATION_STRENGTH` | 0.5f | **0.3f** | 충돌 시 튀는 정도 감소 |
+| `WALL_BOUNCE` | -0.85f | **-0.72f** | 벽 반사 에너지 손실 증가 |
+| `WALL_FRICTION` | 0.98f | **0.99f** | 벽 접촉 시 수직 속도 보존율 향상 |
 
 ```kotlin
 companion object {
     private const val BALL_COUNT = 13
     private const val BALL_RADIUS = 60f
-    private const val DAMPING = 0.995f
-    private const val SENSITIVITY = 45f
+    private const val BALL_SPACING = 180f
+    private const val DAMPING = 0.992f
+    private const val SENSITIVITY = 60f
     private const val MAX_SPEED = 15f
-    private const val SUB_STEPS = 6
-    private const val COLLISION_ITERATIONS = 5
-    private const val SEPARATION_STRENGTH = 0.5f
-    private const val WALL_BOUNCE = -0.85f
-    private const val WALL_FRICTION = 0.98f
+    private const val SUB_STEPS = 8
+    private const val COLLISION_ITERATIONS = 6
+    private const val SEPARATION_STRENGTH = 0.3f
+    private const val WALL_BOUNCE = -0.72f
+    private const val WALL_FRICTION = 0.99f
     private const val SENSOR_ALPHA = 0.1f
-    private const val FRAME_DELAY_MS = 16L
 }
 ```
 

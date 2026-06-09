@@ -56,38 +56,44 @@ fun TiltBallContent(tiltX: Float, tiltY: Float, ...) {
 ### 개선된 코드 구조
 
 ```
-[물리 게임 루프] Dispatchers.Main 코루틴 (고정 16ms 주기)
+[물리 게임 루프] LaunchedEffect + withFrameNanos (vsync 동기화)
     → 물리 계산 실행
         → Ball 위치 상태 업데이트 (SnapshotStateList)
 
 [센서 이벤트] 센서 스레드
-    → tiltX / tiltY 값만 업데이트
+    → tiltX / tiltY 값만 업데이트 (@Volatile)
 
-[Compose] 프레임마다
+[Compose] vsync마다
     → Ball 위치 읽기
         → Canvas 렌더링만 담당
 ```
 
-### 핵심 변경 — PhysicsViewModel
+### 핵심 변경 1 — 게임 루프를 vsync에 동기화
+
+`delay(16L)` 방식은 고정 주기처럼 보이지만 OS 타이머 기준으로 실행되어 실제 화면 갱신(vsync)과 위상 차이가 생깁니다. 이로 인해 물리 업데이트가 렌더링 직후에 발생하면 다음 프레임에야 반영되어 시각적 끊김으로 이어집니다.
+
+`withFrameNanos`는 Compose의 `MonotonicFrameClock`에 동기화되므로 렌더링 직전에 정확히 한 번 물리를 갱신합니다.
 
 ```kotlin
-// ✅ 개선 코드 — ViewModel에서 독립적인 게임 루프 실행
-class PhysicsViewModel(application: Application) : AndroidViewModel(application) {
+// ❌ 이전 — OS 타이머 기준, vsync와 위상 차이 발생
+viewModelScope.launch(Dispatchers.Main) {
+    while (isActive) {
+        if (containerWidth > 0f) updatePhysics()
+        delay(16L)
+    }
+}
 
-    val balls = mutableStateListOf<Ball>()  // Compose가 관찰하는 상태
-
-    private fun startGameLoop() {
-        viewModelScope.launch(Dispatchers.Main) {
-            while (isActive) {
-                if (containerWidth > 0f) updatePhysics()
-                delay(16L)  // ~60fps 고정 주기
-            }
+// ✅ 개선 — Compose 프레임 클럭에 동기화, 렌더링 직전에 정확히 1회 실행
+LaunchedEffect(Unit) {
+    while (true) {
+        withFrameNanos {
+            if (viewModel.containerWidth > 0f) viewModel.updatePhysics()
         }
     }
 }
 ```
 
-### 핵심 변경 — Composable 단순화
+### 핵심 변경 2 — Composable 단순화
 
 ```kotlin
 // ✅ 개선 코드 — Composable은 렌더링만 담당
@@ -140,7 +146,7 @@ fun TiltBallScreen(viewModel: PhysicsViewModel) {
 ```
 Before                          After
 ──────────────────────────────  ──────────────────────────────
-MainActivity.kt                 MainActivity.kt        (렌더링 전용)
+MainActivity.kt                 MainActivity.kt        (렌더링 + 게임 루프 트리거)
   ├── Ball (inner class)   →    Ball.kt                (모델 분리)
   ├── TiltBallScreen           PhysicsViewModel.kt    (물리 + 센서)
   ├── TiltBallContent
@@ -155,6 +161,6 @@ SensorViewModel.kt         →   (PhysicsViewModel에 통합)
 - **Language**: Kotlin
 - **UI**: Jetpack Compose
 - **Architecture**: MVVM
-- **Concurrency**: Kotlin Coroutines (`viewModelScope`, `Dispatchers.Main`)
+- **Concurrency**: Kotlin Coroutines (`LaunchedEffect`, `withFrameNanos`)
 - **Sensor**: Android SensorManager (TYPE_ACCELEROMETER)
 - **Performance Measurement**: `adb shell dumpsys gfxinfo`
