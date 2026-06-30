@@ -11,6 +11,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Fastfive">
+        <profileable android:shell="true"/>
         <activity
             android:name="com.example.fastfive.MainActivity"
             android:exported="true">
